@@ -29,6 +29,8 @@ import {
   fetchWeatherAlerts,
   fetchFredData,
   fetchInternetOutages,
+  fetchTrafficAnomalies,
+  fetchDdosAttacks,
   isOutagesConfigured,
   fetchAisSignals,
   getAisStatus,
@@ -105,6 +107,7 @@ import { fetchOrefAlerts, startOrefPolling, stopOrefPolling, onOrefAlertsUpdate 
 import { enrichEventsWithExposure } from '@/services/population-exposure';
 import { debounce, getCircuitBreakerCooldownInfo } from '@/utils';
 import { getSecretState, isFeatureAvailable, isFeatureEnabled } from '@/services/runtime-config';
+import { isProUser } from '@/services/widget-store';
 import { isDesktopRuntime, toApiUrl } from '@/services/runtime';
 import { getAiFlowSettings } from '@/services/ai-flow-settings';
 import { t, getCurrentLanguage } from '@/services/i18n';
@@ -129,6 +132,7 @@ import {
   MonitorPanel,
   InsightsPanel,
   CIIPanel,
+  InternetDisruptionsPanel,
   StrategicPosturePanel,
   EconomicPanel,
   EnergyComplexPanel,
@@ -240,7 +244,7 @@ export class DataLoaderManager implements AppModule {
   init(): void {
     this.boundMarketWatchlistHandler = () => {
       void this.loadMarkets().then(async () => {
-        if (getSecretState('WORLDMONITOR_API_KEY').present) {
+        if (getSecretState('WORLDMONITOR_API_KEY').present || isProUser()) {
           await this.loadStockAnalysis();
           await this.loadStockBacktest();
           await this.loadDailyMarketBrief(true);
@@ -373,10 +377,12 @@ export class DataLoaderManager implements AppModule {
       if (shouldLoadAny(['markets', 'heatmap', 'commodities', 'crypto', 'energy-complex', 'crypto-heatmap', 'defi-tokens', 'ai-tokens', 'other-tokens'])) {
         tasks.push({ name: 'markets', task: runGuarded('markets', () => this.loadMarkets()) });
       }
-      if (getSecretState('WORLDMONITOR_API_KEY').present && shouldLoad('stock-analysis')) {
+      // TODO(payment-pr): isProUser() checks localStorage/cookie only — not server-validated.
+      // Replace with a server-verified entitlement check once the payment system is in place.
+      if ((getSecretState('WORLDMONITOR_API_KEY').present || isProUser()) && shouldLoad('stock-analysis')) {
         tasks.push({ name: 'stockAnalysis', task: runGuarded('stockAnalysis', () => this.loadStockAnalysis()) });
       }
-      if (getSecretState('WORLDMONITOR_API_KEY').present && shouldLoad('stock-backtest')) {
+      if ((getSecretState('WORLDMONITOR_API_KEY').present || isProUser()) && shouldLoad('stock-backtest')) {
         tasks.push({ name: 'stockBacktest', task: runGuarded('stockBacktest', () => this.loadStockBacktest()) });
       }
       if (shouldLoad('polymarket')) {
@@ -467,9 +473,10 @@ export class DataLoaderManager implements AppModule {
           this.ctx.map?.setLayerReady('ciiChoropleth', true);
         }
       } catch { /* non-fatal */ }
-      if (shouldLoadAny(['cii', 'strategic-risk', 'strategic-posture'])) {
-        tasks.push({ name: 'intelligence', task: runGuarded('intelligence', () => this.loadIntelligenceSignals()) });
-      }
+    }
+    // Intelligence signals: run for any variant that shows these panels
+    if (shouldLoadAny(['cii', 'strategic-risk', 'strategic-posture', 'climate', 'population-exposure', 'security-advisories', 'radiation-watch', 'displacement', 'ucdp-events', 'satellite-fires', 'oref-sirens'])) {
+      tasks.push({ name: 'intelligence', task: runGuarded('intelligence', () => this.loadIntelligenceSignals()) });
     }
 
     if (SITE_VARIANT === 'full' && (shouldLoad('satellite-fires') || this.ctx.mapLayers.natural)) {
@@ -518,7 +525,7 @@ export class DataLoaderManager implements AppModule {
 
     this.updateSearchIndex();
 
-    if (getSecretState('WORLDMONITOR_API_KEY').present) {
+    if (getSecretState('WORLDMONITOR_API_KEY').present || isProUser()) {
       await this.loadDailyMarketBrief();
     }
 
@@ -1362,7 +1369,7 @@ export class DataLoaderManager implements AppModule {
   }
 
   async loadDailyMarketBrief(force = false): Promise<void> {
-    if (!getSecretState('WORLDMONITOR_API_KEY').present) return;
+    if (!getSecretState('WORLDMONITOR_API_KEY').present && !isProUser()) return;
     if (this.ctx.isDestroyed || this.ctx.inFlight.has('dailyMarketBrief')) return;
 
     this.ctx.inFlight.add('dailyMarketBrief');
@@ -1580,6 +1587,15 @@ export class DataLoaderManager implements AppModule {
           this.ctx.map?.setLayerReady('outages', outages.length > 0);
           this.ctx.statusPanel?.updateFeed('NetBlocks', { status: 'ok', itemCount: outages.length });
         }
+        (this.ctx.panels['internet-disruptions'] as InternetDisruptionsPanel)?.setOutages(outages);
+        fetchTrafficAnomalies().then(r => {
+          this.ctx.map?.setTrafficAnomalies(r.anomalies);
+          (this.ctx.panels['internet-disruptions'] as InternetDisruptionsPanel)?.setAnomalies(r.anomalies);
+        }).catch(() => {});
+        fetchDdosAttacks().then(r => {
+          this.ctx.map?.setDdosLocations(r.topTargetLocations ?? []);
+          (this.ctx.panels['internet-disruptions'] as InternetDisruptionsPanel)?.setDdos(r);
+        }).catch(() => {});
       } catch (error) {
         console.error('[Intelligence] Outages fetch failed:', error);
         dataFreshness.recordError('outages', String(error));
@@ -1887,6 +1903,15 @@ export class DataLoaderManager implements AppModule {
       signalAggregator.ingestOutages(outages);
       this.ctx.statusPanel?.updateFeed('NetBlocks', { status: 'ok', itemCount: outages.length });
       dataFreshness.recordUpdate('outages', outages.length);
+      (this.ctx.panels['internet-disruptions'] as InternetDisruptionsPanel)?.setOutages(outages);
+      fetchTrafficAnomalies().then(r => {
+        this.ctx.map?.setTrafficAnomalies(r.anomalies);
+        (this.ctx.panels['internet-disruptions'] as InternetDisruptionsPanel)?.setAnomalies(r.anomalies);
+      }).catch(() => {});
+      fetchDdosAttacks().then(r => {
+        this.ctx.map?.setDdosLocations(r.topTargetLocations ?? []);
+        (this.ctx.panels['internet-disruptions'] as InternetDisruptionsPanel)?.setDdos(r);
+      }).catch(() => {});
     } catch (error) {
       this.ctx.map?.setLayerReady('outages', false);
       this.ctx.statusPanel?.updateFeed('NetBlocks', { status: 'error' });
@@ -2266,9 +2291,9 @@ export class DataLoaderManager implements AppModule {
 
   async loadFredData(): Promise<void> {
     const economicPanel = this.ctx.panels['economic'] as EconomicPanel;
-    const cbInfo = getCircuitBreakerCooldownInfo('FRED Economic');
+    const cbInfo = getCircuitBreakerCooldownInfo('FRED Batch');
     if (cbInfo.onCooldown) {
-      economicPanel?.showRetrying(undefined, cbInfo.remainingSeconds);
+      economicPanel?.setFredRetrying(cbInfo.remainingSeconds);
       this.ctx.statusPanel?.updateApi('FRED', { status: 'error' });
       return;
     }
@@ -2277,20 +2302,20 @@ export class DataLoaderManager implements AppModule {
       economicPanel?.setLoading(true);
       const data = await fetchFredData();
 
-      const postInfo = getCircuitBreakerCooldownInfo('FRED Economic');
+      const postInfo = getCircuitBreakerCooldownInfo('FRED Batch');
       if (postInfo.onCooldown) {
-        economicPanel?.showRetrying(undefined, postInfo.remainingSeconds);
+        economicPanel?.setFredRetrying(postInfo.remainingSeconds);
         this.ctx.statusPanel?.updateApi('FRED', { status: 'error' });
         return;
       }
 
       if (data.length === 0) {
         if (!isFeatureAvailable('economicFred')) {
-          economicPanel?.showConfigError(t('components.economic.fredKeyMissing'));
+          economicPanel?.setFredError(t('components.economic.fredKeyMissing'));
           this.ctx.statusPanel?.updateApi('FRED', { status: 'error' });
           return;
         }
-        economicPanel?.showError(t('common.upstreamUnavailable'));
+        economicPanel?.setFredError(t('common.upstreamUnavailable'));
         this.ctx.statusPanel?.updateApi('FRED', { status: 'error' });
         return;
       }
@@ -2300,8 +2325,7 @@ export class DataLoaderManager implements AppModule {
       dataFreshness.recordUpdate('economic', data.length);
     } catch {
       this.ctx.statusPanel?.updateApi('FRED', { status: 'error' });
-      economicPanel?.showError();
-      economicPanel?.setLoading(false);
+      economicPanel?.setFredError(t('common.failedToLoad'));
     }
   }
 

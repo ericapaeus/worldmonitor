@@ -178,7 +178,7 @@
       "protestsDetected": "{{count}} active protests detected",
       "aircraftTracked": "{{count}} military aircraft tracked",
       "vesselsTracked": "{{count}} military vessels tracked",
-      "internetOutages": "{{count}} internet outages",
+      "internetOutages": "{{count}} internet disruptions",
       "recentEarthquakes": "{{count}} recent earthquakes",
       "stockIndex": "Stock index: {{value}}",
       "recentHeadlines": "**Recent headlines:**",
@@ -343,6 +343,12 @@
     "producthunt": "Product Hunt",
     "events": "Tech Events",
     "serviceStatus": "Service Status",
+    "internetDisruptions": "Internet Disruptions",
+    "internetDisruptionsTabs": {
+      "outages": "Outages",
+      "ddos": "DDoS",
+      "anomalies": "Anomalies"
+    },
     "techReadiness": "Tech Readiness Index",
     "gccInvestments": "GCC Investments",
     "geoHubs": "Geopolitical Hubs",
@@ -351,7 +357,7 @@
     "gulfEconomies": "Gulf Economies",
     "groceryBasket": "Grocery Index",
     "groceryItem": "Item",
-    "bigmac": "Big Mac Index",
+    "bigmac": "Updated Big Mac Index",
     "bigmacDesc": "Big Mac prices across Middle East countries (Big Mac Index)",
     "bigmacWow": "WoW",
     "bigmacCountry": "Country",
@@ -393,12 +399,14 @@
       "layers": "Type \"military\" or \"finance\" for layer presets",
       "time": "Type \"1h\", \"24h\", or \"7d\" to filter by time",
       "settings": "Type \"dark mode\", \"settings\", or \"fullscreen\"",
+      "flight": "Search live flights by callsign (PRO)",
       "mapExample": "iran",
       "panelExample": "news",
       "briefExample": "brief china",
       "layersExample": "military layers",
       "timeExample": "24h",
-      "settingsExample": "dark mode"
+      "settingsExample": "dark mode",
+      "flightExample": "UAE528"
     },
     "keywords": {
       "military": "military",
@@ -494,8 +502,15 @@
         "startup": "Startup",
         "techevent": "Tech Event",
         "techhq": "Tech HQ",
-        "accelerator": "Accelerator"
-      }
+        "accelerator": "Accelerator",
+        "flight": "Flight"
+      },
+      "flightOnGround": "On ground",
+      "flightAirborne": "FL{{fl}} · {{kts}} kts",
+      "flightMilitary": "Military · {{type}} · FL{{fl}}",
+      "flightMilitaryOnGround": "Military · {{type}} · on ground",
+      "flightSearchHint": "Press Enter or click to look up live position",
+      "flightNotFound": "No live position found for {{callsign}}"
     },
     "signal": {
       "title": "INTELLIGENCE FINDING",
@@ -607,6 +622,8 @@
       }
     },
     "settingsWindow": {
+      "freePanelLimit": "Free plan: max {{max}} panels. Upgrade to PRO for unlimited.",
+      "freeSourceLimit": "Free plan: max {{max}} sources. Upgrade to PRO for unlimited.",
       "validating": "Validating API keys...",
       "saved": "Settings saved",
       "failed": "Save failed: {{error}}",
@@ -742,7 +759,7 @@
         "aircraftTracked": "{{count}} military aircraft tracked",
         "vesselsTracked": "{{count}} military vessels tracked",
         "activeStrikes": "{{count}} active strikes detected",
-        "internetOutages": "{{count}} internet outages",
+        "internetOutages": "{{count}} internet disruptions",
         "recentEarthquakes": "{{count}} recent earthquakes",
         "stockIndex": "Stock index: {{value}}",
         "recentHeadlines": "**Recent headlines:**"
@@ -1014,7 +1031,8 @@
       "token": "Token",
       "mcap": "MCap",
       "vol24h": "24h Vol",
-      "chg24h": "24h Chg"
+      "chg24h": "24h Chg",
+      "infoTooltip": "<strong>Stablecoins</strong> Peg health, market cap, and 24h volume for major USD-pegged tokens (USDT, USDC, DAI, BUSD). A broken peg signals systemic risk."
     },
     "status": {
       "dataFeeds": "Data Feeds",
@@ -1139,7 +1157,7 @@
       "nuclear": "Nuclear"
     },
     "community": {
-      "joinDiscussion": "Join Discord",
+      "joinDiscussion": "Help Shape What's Next",
       "openDiscussion": "Join Discord",
       "dontShowAgain": "Don't show again",
       "sectionLabel": "Community"
@@ -1204,7 +1222,7 @@
         "cloudRegions": "Cloud Regions",
         "aiDataCenters": "AI Data Centers",
         "underseaCables": "Undersea Cables",
-        "internetOutages": "Internet Outages",
+        "internetOutages": "Internet Disruptions",
         "cyberThreats": "Cyber Threats",
         "techEvents": "Tech Events",
         "naturalEvents": "Natural Events",
@@ -1267,7 +1285,7 @@
         "disruption": "Disruption",
         "advisory": "Advisory",
         "repairShip": "Repair Ship",
-        "internetOutage": "Internet Outage",
+        "internetOutage": "Internet Disruption",
         "medium": "medium",
         "news": "News",
         "undisclosed": "Undisclosed",
@@ -1832,6 +1850,39 @@
     "commodities": {
       "infoTooltip": "<strong>Commodities</strong> Tradeable non-energy commodity tape focused on metals and materials. Energy prices live in Energy Complex; macro stress indicators live in Macro Stress."
     },
+    "crypto": {
+      "infoTooltip": "<strong>Crypto</strong> Live prices, 24h changes, and volume for major cryptocurrencies. Data sourced from CoinGecko."
+    },
+    "defiTokens": {
+      "infoTooltip": "<strong>DeFi Tokens</strong> Prices and 24h/7d performance for major decentralized finance protocol tokens — DEXes, lending platforms, and yield protocols."
+    },
+    "aiTokens": {
+      "infoTooltip": "<strong>AI Tokens</strong> Prices and 24h/7d performance for AI and machine learning sector tokens — compute networks, decentralized AI infrastructure, and data protocols."
+    },
+    "altTokens": {
+      "infoTooltip": "<strong>Alt Tokens</strong> Prices and 24h/7d performance for alternative and emerging crypto tokens outside the major-cap tiers."
+    },
+    "stockAnalysis": {
+      "infoTooltip": "<strong>Premium Stock Analysis</strong> AI-powered analysis for stocks in your watchlist — buy/hold/sell signals, price targets, key risks, and catalysts updated daily."
+    },
+    "stockBacktest": {
+      "infoTooltip": "<strong>Premium Backtesting</strong> Historical performance backtests for stocks in your watchlist — past returns, max drawdown, and volatility metrics."
+    },
+    "dailyMarketBrief": {
+      "infoTooltip": "<strong>Daily Market Brief</strong> AI-generated daily summary of global market conditions, key macro trends, and sector-level signals — refreshes each trading day."
+    },
+    "centralBankWatch": {
+      "infoTooltip": "<strong>Central Bank Watch</strong> Latest statements, rate decisions, and communications from the Federal Reserve, ECB, Bank of England, and other major central banks worldwide."
+    },
+    "gulfEconomies": {
+      "infoTooltip": "<strong>Gulf Economies</strong> Real-time Gulf stock indices, currency rates, and oil prices for GCC economies (Saudi Arabia, UAE, Kuwait, Qatar, Bahrain, Oman)."
+    },
+    "groceryBasket": {
+      "infoTooltip": "<strong>Grocery Index</strong> Global grocery basket price comparison across 24 countries — tracks real-world consumer goods inflation beyond headline CPI."
+    },
+    "bigmac": {
+      "infoTooltip": "<strong>Updated Big Mac Index</strong> The Economist's Big Mac Index measures purchasing power parity by comparing McDonald's burger prices across countries. Updated when new data is published (quarterly/annually)."
+    },
     "panel": {
       "showMethodologyInfo": "Show methodology info",
       "dragToResize": "Drag to resize (double-click to reset)",
@@ -1842,6 +1893,15 @@
     "languageSelector": {
       "selectLanguage": "Select Language",
       "mapLabelsFallbackVi": "Map labels currently fall back to English for Vietnamese."
+    },
+    "internetDisruptions": {
+      "noOutages": "No active outages detected",
+      "noDdos": "No DDoS data available",
+      "noAnomalies": "No traffic anomalies detected",
+      "byProtocol": "Attack Protocol",
+      "byVector": "Attack Vector",
+      "topTargets": "Top Target Countries",
+      "infoTooltip": "<strong>Internet Disruptions</strong> Real-time internet outages, DDoS attacks, and traffic anomalies from global network monitoring:<ul><li><strong>Outages</strong>: BGP-detected connectivity failures by country</li><li><strong>DDoS</strong>: Volumetric attack reports by protocol and vector</li><li><strong>Anomalies</strong>: Unusual traffic patterns from Cloudflare Radar</li></ul>"
     },
     "serviceStatus": {
       "checkingServices": "Checking services...",
@@ -2671,6 +2731,8 @@
     "invalidJson": "Invalid JSON",
     "confirmDelete": "Remove this MCP panel?",
     "quickConnect": "Quick Connect",
-    "or": "or enter a custom server"
+    "or": "or enter a custom server",
+    "generatingVisualization": "Building visualization...",
+    "visualizationFailed": "Visualization failed"
   }
 }

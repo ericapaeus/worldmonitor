@@ -26,7 +26,6 @@ function formatPositionSource(source: string): string {
   if (source === 'POSITION_SOURCE_OPENSKY') {
     return '<a href="https://opensky-network.org" target="_blank" rel="noopener" style="color:inherit">opensky-network.org</a>';
   }
-  if (source === 'POSITION_SOURCE_SIMULATED') return 'Simulated';
   return escapeHtml(source);
 }
 
@@ -907,6 +906,12 @@ export class MapPopup {
           const credit = live.photoCredit ? `<span class="flight-photo-credit">\u00a9 ${escapeHtml(live.photoCredit)}</span>` : '';
           photoHtml = `<div class="flight-photo"><a href="${photoLink}" target="_blank" rel="noopener"><img src="${photoSrc}" alt="${escapeHtml(live.callsign)}" style="width:100%;border-radius:4px;display:block"></a>${credit}</div>`;
         }
+      }
+
+      // IATA callsign + airline name header
+      if (live.callsignIata) {
+        const name = live.airlineName ? ` <span style="font-size:12px;opacity:0.6;font-weight:400">${escapeHtml(live.airlineName)}</span>` : '';
+        parts.push(`<div style="font-weight:700;font-size:15px;margin:4px 0">${escapeHtml(live.callsignIata)}${name}</div>`);
       }
 
       // Route (FROM → TO)

@@ -3,11 +3,13 @@ import type { AirlineIntelPanel } from '@/components/AirlineIntelPanel';
 import type { CustomWidgetPanel } from '@/components/CustomWidgetPanel';
 import { openWidgetChatModal } from '@/components/WidgetChatModal';
 import { deleteWidget, getWidget, saveWidget, isProUser } from '@/services/widget-store';
+import { FREE_MAX_PANELS, FREE_MAX_SOURCES } from '@/config/panels';
 import type { McpDataPanel } from '@/components/McpDataPanel';
 import { openMcpConnectModal } from '@/components/McpConnectModal';
 import { deleteMcpPanel, getMcpPanel, saveMcpPanel } from '@/services/mcp-store';
-import type { PanelConfig, MapLayers } from '@/types';
+import type { PanelConfig, MapLayers, MilitaryFlight } from '@/types';
 import type { MapView } from '@/components';
+import type { PositionSample } from '@/services/aviation';
 import type { ClusteredEvent } from '@/types';
 import type { DashboardSnapshot } from '@/services/storage';
 import {
@@ -54,6 +56,7 @@ import {
 import { detectPlatform, allButtons, buttonsForPlatform } from '@/components/DownloadBanner';
 import type { Platform } from '@/components/DownloadBanner';
 import { invokeTauri } from '@/services/tauri-bridge';
+import { getCachedGpsInterference } from '@/services/gps-interference';
 import { dataFreshness } from '@/services/data-freshness';
 import { mlWorker } from '@/services/ml-worker';
 import { UnifiedSettings } from '@/components/UnifiedSettings';
@@ -62,6 +65,7 @@ import { TvModeController } from '@/services/tv-mode';
 
 export interface EventHandlerCallbacks {
   updateSearchIndex: () => void;
+  updateFlightSource?: (adsb: PositionSample[], military: MilitaryFlight[]) => void;
   loadAllData: () => Promise<void>;
   flushStaleRefreshes: () => void;
   setHiddenSince: (ts: number) => void;
@@ -131,6 +135,10 @@ export class EventHandlerManager implements AppModule {
     if (!panelId) return;
     const config = this.ctx.panelSettings[panelId];
     if (!config) return;
+    if (!isProUser()) {
+      const enabledCount = Object.entries(this.ctx.panelSettings).filter(([k, p]) => p.enabled && !k.startsWith('cw-')).length;
+      if (enabledCount >= FREE_MAX_PANELS) return;
+    }
     config.enabled = true;
     trackPanelToggled(panelId, true);
     saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);
@@ -920,12 +928,29 @@ export class EventHandlerManager implements AppModule {
 
   setupExportPanel(): void {
     if (!isProUser()) return;
-    this.ctx.exportPanel = new ExportPanel(() => ({
-      news: this.ctx.latestClusters.length > 0 ? this.ctx.latestClusters : this.ctx.allNews,
-      markets: this.ctx.latestMarkets,
-      predictions: this.ctx.latestPredictions,
-      timestamp: Date.now(),
-    }));
+    this.ctx.exportPanel = new ExportPanel(() => {
+      const allCards = this.ctx.correlationEngine?.getAllCards() ?? [];
+      const disabledCount = this.ctx.disabledSources.size;
+      return {
+        meta: {
+          exportedAt: new Date().toISOString(),
+          note: disabledCount > 0
+            ? `Export reflects currently enabled sources only. ${disabledCount} source(s) are disabled and not included.`
+            : 'Export reflects all active sources.',
+        },
+        timestamp: Date.now(),
+        news: this.ctx.allNews,
+        newsClusters: this.ctx.latestClusters.length > 0 ? this.ctx.latestClusters : undefined,
+        newsByCategory: this.ctx.newsByCategory,
+        markets: this.ctx.latestMarkets,
+        predictions: this.ctx.latestPredictions,
+        intelligence: this.ctx.intelligenceCache,
+        cyberThreats: this.ctx.cyberThreatsCache ?? undefined,
+        gpsJamming: getCachedGpsInterference() ?? undefined,
+        convergenceCards: allCards.map(({ assessment: _a, ...card }) => card),
+        monitors: this.ctx.monitors.length > 0 ? this.ctx.monitors : undefined,
+      };
+    });
 
     const headerRight = this.ctx.container.querySelector('.header-right');
     if (headerRight) {
@@ -951,10 +976,20 @@ export class EventHandlerManager implements AppModule {
         });
         saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);
         this.applyPanelSettings();
+        this.callbacks.updateSearchIndex();
       },
       getDisabledSources: () => this.ctx.disabledSources,
       toggleSource: (name: string) => {
-        if (this.ctx.disabledSources.has(name)) {
+        const reenabling = this.ctx.disabledSources.has(name);
+        if (reenabling && !isProUser()) {
+          const allSources = this.getAllSourceNames();
+          const currentlyEnabled = allSources.filter(n => !this.ctx.disabledSources.has(n)).length;
+          if (currentlyEnabled + 1 > FREE_MAX_SOURCES) {
+            this.showToast(t('modals.settingsWindow.freeSourceLimit', { max: String(FREE_MAX_SOURCES) }));
+            return;
+          }
+        }
+        if (reenabling) {
           this.ctx.disabledSources.delete(name);
         } else {
           this.ctx.disabledSources.add(name);
@@ -962,6 +997,15 @@ export class EventHandlerManager implements AppModule {
         saveToStorage(STORAGE_KEYS.disabledFeeds, Array.from(this.ctx.disabledSources));
       },
       setSourcesEnabled: (names: string[], enabled: boolean) => {
+        if (enabled && !isProUser()) {
+          const allSources = this.getAllSourceNames();
+          const currentlyEnabled = allSources.filter(n => !this.ctx.disabledSources.has(n)).length;
+          const wouldEnable = names.filter(n => this.ctx.disabledSources.has(n) && allSources.includes(n)).length;
+          if (currentlyEnabled + wouldEnable > FREE_MAX_SOURCES) {
+            this.showToast(t('modals.settingsWindow.freeSourceLimit', { max: String(FREE_MAX_SOURCES) }));
+            return;
+          }
+        }
         for (const name of names) {
           if (enabled) this.ctx.disabledSources.delete(name);
           else this.ctx.disabledSources.add(name);
@@ -1100,11 +1144,13 @@ export class EventHandlerManager implements AppModule {
       }
     });
 
-    // Forward live aircraft positions from map to AirlineIntelPanel + cache
+    // Forward live aircraft positions from map to AirlineIntelPanel + cache + search index
     this.ctx.map?.setOnAircraftPositionsUpdate((positions) => {
       this.ctx.intelligenceCache.aircraftPositions = positions;
       const airlineIntel = this.ctx.panels['airline-intel'] as AirlineIntelPanel | undefined;
       airlineIntel?.updateLivePositions(positions);
+      const military = this.ctx.intelligenceCache.military?.flights ?? [];
+      this.callbacks.updateFlightSource?.(positions, military);
     });
   }
 

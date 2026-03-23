@@ -1142,7 +1142,8 @@ async function startUcdpSeedLoop() {
 // Satellite TLE Seed — CelesTrak NORAD elements → Redis
 // ─────────────────────────────────────────────────────────────
 const SAT_SEED_INTERVAL_MS = 7_200_000;
-const SAT_SEED_TTL = 14_400;
+const SAT_SEED_TTL = 21_600; // 6h — survives 3 missed cycles before data expires
+const SAT_RETRY_MS = 20 * 60 * 1000; // retry 20min after failure instead of waiting 120min
 const SAT_GROUPS = ['military', 'resource'];
 
 const SAT_NAME_FILTERS = [
@@ -1178,10 +1179,12 @@ function satClassify(name) {
 }
 
 let satSeedInFlight = false;
+let satRetryTimer = null;
 
 async function seedSatelliteTLEs() {
   if (satSeedInFlight) return;
   satSeedInFlight = true;
+  if (satRetryTimer) { clearTimeout(satRetryTimer); satRetryTimer = null; }
   const t0 = Date.now();
   try {
     const byNorad = new Map();
@@ -1237,7 +1240,9 @@ async function seedSatelliteTLEs() {
     }
 
     if (satellites.length === 0) {
-      console.warn('[Satellites] No matching TLEs found — skipping write');
+      console.warn('[Satellites] No matching TLEs found — extending existing key TTL, retrying in 20min');
+      try { await upstashExpire('intelligence:satellites:tle:v1', SAT_SEED_TTL); } catch {}
+      satRetryTimer = setTimeout(() => { seedSatelliteTLEs().catch(() => {}); }, SAT_RETRY_MS);
       return;
     }
 
@@ -1246,7 +1251,9 @@ async function seedSatelliteTLEs() {
     await upstashSet('seed-meta:intelligence:satellites', { fetchedAt: Date.now(), recordCount: satellites.length }, 604800);
     console.log(`[Satellites] Seeded ${satellites.length} TLEs (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
-    console.warn('[Satellites] Seed error:', e?.message || e);
+    console.warn('[Satellites] Seed error:', e?.message || e, '— extending existing key TTL, retrying in 20min');
+    try { await upstashExpire('intelligence:satellites:tle:v1', SAT_SEED_TTL); } catch {}
+    satRetryTimer = setTimeout(() => { seedSatelliteTLEs().catch(() => {}); }, SAT_RETRY_MS);
   } finally {
     satSeedInFlight = false;
   }
@@ -1277,11 +1284,12 @@ const MARKET_SYMBOLS = [
   'AAPL', 'AMZN', 'AVGO', 'BAC', 'BRK-B', 'COST', 'GOOGL', 'HD',
   'JNJ', 'JPM', 'LLY', 'MA', 'META', 'MSFT', 'NFLX', 'NVO', 'NVDA',
   'ORCL', 'PG', 'TSLA', 'TSM', 'UNH', 'V', 'WMT', 'XOM',
-  '^DJI', '^GSPC', '^IXIC',
+  '^DJI', '^GSPC', '^IXIC', '^RUT',
 ];
 
 const _commodityCfg = requireShared('commodities.json');
 const COMMODITY_SYMBOLS = _commodityCfg.commodities.map(c => c.symbol);
+const COMMODITY_META = new Map(_commodityCfg.commodities.map(c => [c.symbol, { name: c.name, display: c.display }]));
 
 const SECTOR_SYMBOLS = ['XLK', 'XLF', 'XLE', 'XLV', 'XLY', 'XLI', 'XLP', 'XLU', 'XLB', 'XLRE', 'XLC', 'SMH'];
 
@@ -1289,7 +1297,7 @@ const SECTOR_SYMBOLS = ['XLK', 'XLF', 'XLE', 'XLV', 'XLY', 'XLI', 'XLP', 'XLU', 
 // ^GSPC/^DJI/^IXIC live in MARKET_SYMBOLS (not COMMODITY_SYMBOLS) so they must be listed
 // explicitly; commodity ETFs (URA, LIT) also go through Yahoo since they have no Finnhub feed.
 const YAHOO_ONLY = new Set([
-  '^GSPC', '^DJI', '^IXIC',
+  '^GSPC', '^DJI', '^IXIC', '^RUT',
   ...COMMODITY_SYMBOLS.filter(s => s.endsWith('=F') || s.startsWith('^')),
   'URA', 'LIT',
 ]);
@@ -1402,8 +1410,9 @@ async function seedCommodityQuotes() {
   const quotes = [];
   const missing = [];
   for (const s of COMMODITY_SYMBOLS) {
+    const meta = COMMODITY_META.get(s) || { name: s, display: s };
     const yahoo = await fetchYahooChartDirect(s);
-    if (yahoo) quotes.push({ symbol: s, name: s, display: s, price: yahoo.price, change: yahoo.change, sparkline: yahoo.sparkline });
+    if (yahoo) quotes.push({ symbol: s, name: meta.name, display: meta.display, price: yahoo.price, change: yahoo.change, sparkline: yahoo.sparkline });
     else missing.push(s);
     await sleep(150);
   }
@@ -1411,14 +1420,16 @@ async function seedCommodityQuotes() {
   if (missing.length > 0) {
     await sleep(3000);
     for (const s of missing) {
+      const meta = COMMODITY_META.get(s);
       const yahoo = await fetchYahooChartDirect(s);
-      if (yahoo) quotes.push({ symbol: s, name: s, display: s, price: yahoo.price, change: yahoo.change, sparkline: yahoo.sparkline });
+      if (yahoo) quotes.push({ symbol: s, name: meta.name, display: meta.display, price: yahoo.price, change: yahoo.change, sparkline: yahoo.sparkline });
       await sleep(200);
     }
   }
 
   if (quotes.length === 0) {
-    console.warn('[Market] No commodity quotes fetched — skipping Redis write');
+    console.warn('[Market] No commodity quotes fetched — extending existing key TTL, skipping write');
+    try { await upstashExpire('market:commodities-bootstrap:v1', MARKET_SEED_TTL); } catch {}
     return 0;
   }
 
@@ -1582,7 +1593,7 @@ const _cryptoCfg = requireShared('crypto.json');
 const CRYPTO_IDS = _cryptoCfg.ids;
 const CRYPTO_META = _cryptoCfg.meta;
 const CRYPTO_PAPRIKA_MAP = _cryptoCfg.coinpaprika;
-const CRYPTO_SEED_TTL = 3600; // 1h
+const CRYPTO_SEED_TTL = 7200; // 2h — 1h buffer over 5min cron cadence (was 1h = 55min buffer)
 
 async function fetchCryptoCoinPaprika() {
   const data = await cyberHttpGetJson('https://api.coinpaprika.com/v1/tickers?quotes=USD', { Accept: 'application/json' }, 15000);
@@ -1628,7 +1639,7 @@ async function seedCryptoQuotes() {
 // Stablecoin Markets — CoinGecko → CoinPaprika fallback
 const STABLECOIN_IDS = 'tether,usd-coin,dai,first-digital-usd,ethena-usde';
 const STABLECOIN_PAPRIKA_MAP = { tether: 'usdt-tether', 'usd-coin': 'usdc-usd-coin', dai: 'dai-dai', 'first-digital-usd': 'fdusd-first-digital-usd', 'ethena-usde': 'usde-ethena-usde' };
-const STABLECOIN_SEED_TTL = 3600; // 1h
+const STABLECOIN_SEED_TTL = 7200; // 2h — 1h buffer over 5min cron cadence (was 1h = 55min buffer)
 
 async function fetchStablecoinCoinPaprika() {
   const data = await cyberHttpGetJson('https://api.coinpaprika.com/v1/tickers?quotes=USD', { Accept: 'application/json' }, 15000);
@@ -1678,7 +1689,7 @@ async function seedStablecoinMarkets() {
 // Crypto Sectors Heatmap — CoinGecko sector averages
 const _sectorsCfg = requireShared('crypto-sectors.json');
 const SECTORS_LIST = _sectorsCfg.sectors;
-const SECTORS_SEED_TTL = 3600; // 1h
+const SECTORS_SEED_TTL = 7200; // 2h — 1h buffer over 5min cron cadence (was 1h = 55min buffer)
 
 async function seedCryptoSectors() {
   const allIds = [...new Set(SECTORS_LIST.flatMap((s) => s.tokens))];
@@ -1816,6 +1827,7 @@ async function startMarketDataSeedLoop() {
 const AVIATIONSTACK_API_KEY = process.env.AVIATIONSTACK_API || '';
 const AVIATION_SEED_INTERVAL_MS = 30 * 60 * 1000; // 30min
 const AVIATION_SEED_TTL = 10800; // 3h — 6x interval; survives ~5 consecutive missed pings
+const AVIATION_RETRY_MS = 20 * 60 * 1000;
 const AVIATION_REDIS_KEY = 'aviation:delays:intl:v3';
 const AVIATION_BATCH_CONCURRENCY = 10;
 const AVIATION_MIN_FLIGHTS_FOR_CLOSURE = 10;
@@ -2022,45 +2034,61 @@ function aviationAggregateFlights(iata, flights) {
   };
 }
 
+let aviationSeedInFlight = false;
+let aviationRetryTimer = null;
+
 async function seedAviationDelays() {
   if (!AVIATIONSTACK_API_KEY) {
     console.log('[Aviation] No AVIATIONSTACK_API key — skipping seed');
     return;
   }
+  if (aviationSeedInFlight) return;
+  aviationSeedInFlight = true;
+  if (aviationRetryTimer) { clearTimeout(aviationRetryTimer); aviationRetryTimer = null; }
 
   const t0 = Date.now();
   const alerts = [];
   let succeeded = 0, failed = 0;
   const deadline = Date.now() + 50_000;
 
-  for (let i = 0; i < AVIATIONSTACK_AIRPORTS.length; i += AVIATION_BATCH_CONCURRENCY) {
-    if (Date.now() >= deadline) {
-      console.warn(`[Aviation] Deadline hit after ${succeeded + failed}/${AVIATIONSTACK_AIRPORTS.length} airports`);
-      break;
-    }
-    const chunk = AVIATIONSTACK_AIRPORTS.slice(i, i + AVIATION_BATCH_CONCURRENCY);
-    const results = await Promise.allSettled(
-      chunk.map((iata) => fetchAviationStackSingle(AVIATIONSTACK_API_KEY, iata))
-    );
-    for (const r of results) {
-      if (r.status === 'fulfilled') {
-        if (r.value.ok) { succeeded++; if (r.value.alert) alerts.push(r.value.alert); }
-        else failed++;
-      } else {
-        failed++;
+  try {
+    for (let i = 0; i < AVIATIONSTACK_AIRPORTS.length; i += AVIATION_BATCH_CONCURRENCY) {
+      if (Date.now() >= deadline) {
+        console.warn(`[Aviation] Deadline hit after ${succeeded + failed}/${AVIATIONSTACK_AIRPORTS.length} airports`);
+        break;
+      }
+      const chunk = AVIATIONSTACK_AIRPORTS.slice(i, i + AVIATION_BATCH_CONCURRENCY);
+      const results = await Promise.allSettled(
+        chunk.map((iata) => fetchAviationStackSingle(AVIATIONSTACK_API_KEY, iata))
+      );
+      for (const r of results) {
+        if (r.status === 'fulfilled') {
+          if (r.value.ok) { succeeded++; if (r.value.alert) alerts.push(r.value.alert); }
+          else failed++;
+        } else {
+          failed++;
+        }
       }
     }
-  }
 
-  const healthy = AVIATIONSTACK_AIRPORTS.length < 5 || failed <= succeeded;
-  if (!healthy) {
-    console.warn(`[Aviation] Systemic failure: ${failed}/${failed + succeeded} airports failed — preserving existing cache`);
-    return;
-  }
+    const healthy = AVIATIONSTACK_AIRPORTS.length < 5 || failed <= succeeded;
+    if (!healthy) {
+      console.warn(`[Aviation] Systemic failure: ${failed}/${failed + succeeded} airports failed — extending TTL, retrying in 20min`);
+      try { await upstashExpire(AVIATION_REDIS_KEY, AVIATION_SEED_TTL); } catch {}
+      aviationRetryTimer = setTimeout(() => { seedAviationDelays().catch(() => {}); }, AVIATION_RETRY_MS);
+      return;
+    }
 
-  const ok = await upstashSet(AVIATION_REDIS_KEY, { alerts }, AVIATION_SEED_TTL);
-  await upstashSet('seed-meta:aviation:intl', { fetchedAt: Date.now(), recordCount: alerts.length }, 604800);
-  console.log(`[Aviation] Seeded ${alerts.length} alerts (${succeeded} ok, ${failed} failed, redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    const ok = await upstashSet(AVIATION_REDIS_KEY, { alerts }, AVIATION_SEED_TTL);
+    await upstashSet('seed-meta:aviation:intl', { fetchedAt: Date.now(), recordCount: alerts.length }, 604800);
+    console.log(`[Aviation] Seeded ${alerts.length} alerts (${succeeded} ok, ${failed} failed, redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    console.warn('[Aviation] Seed error:', e?.message || e, '— extending TTL, retrying in 20min');
+    try { await upstashExpire(AVIATION_REDIS_KEY, AVIATION_SEED_TTL); } catch {}
+    aviationRetryTimer = setTimeout(() => { seedAviationDelays().catch(() => {}); }, AVIATION_RETRY_MS);
+  } finally {
+    aviationSeedInFlight = false;
+  }
 }
 
 async function startAviationSeedLoop() {
@@ -2085,6 +2113,7 @@ async function startAviationSeedLoop() {
 // ─────────────────────────────────────────────────────────────
 const NOTAM_SEED_INTERVAL_MS = 30 * 60 * 1000; // 30min
 const NOTAM_SEED_TTL = 10800; // 3h — 6x interval; survives ~5 consecutive missed pings
+const NOTAM_RETRY_MS = 20 * 60 * 1000;
 const NOTAM_REDIS_KEY = 'aviation:notam:closures:v2';
 const NOTAM_CLOSURE_QCODES = new Set(['FA', 'AH', 'AL', 'AW', 'AC', 'AM']);
 const NOTAM_MONITORED_ICAO = [
@@ -2143,18 +2172,25 @@ function fetchIcaoNotams() {
   });
 }
 
+let notamSeedInFlight = false;
+let notamRetryTimer = null;
+
 async function seedNotamClosures() {
   if (!ICAO_API_KEY) {
     console.log('[NOTAM-Seed] No ICAO_API_KEY — skipping');
     return;
   }
+  if (notamSeedInFlight) return;
+  notamSeedInFlight = true;
+  if (notamRetryTimer) { clearTimeout(notamRetryTimer); notamRetryTimer = null; }
 
   const t0 = Date.now();
+  try {
   const notams = await fetchIcaoNotams();
   if (notams.length === 0) {
-    await upstashExpire(NOTAM_REDIS_KEY, NOTAM_SEED_TTL);
-    await upstashSet('seed-meta:aviation:notam', { fetchedAt: Date.now(), recordCount: 0 }, 604800);
-    console.log('[NOTAM-Seed] No NOTAMs received — refreshed data key TTL, preserving existing cache');
+    try { await upstashExpire(NOTAM_REDIS_KEY, NOTAM_SEED_TTL); } catch {}
+    console.log('[NOTAM-Seed] No NOTAMs received — refreshed data key TTL, retrying in 20min');
+    notamRetryTimer = setTimeout(() => { seedNotamClosures().catch(() => {}); }, NOTAM_RETRY_MS);
     return;
   }
 
@@ -2186,6 +2222,13 @@ async function seedNotamClosures() {
   await upstashSet('seed-meta:aviation:notam', { fetchedAt: Date.now(), recordCount: closedIcaos.length }, 604800);
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
   console.log(`[NOTAM-Seed] ${notams.length} raw NOTAMs, ${closedIcaos.length} closures (redis: ${ok ? 'OK' : 'FAIL'}) in ${elapsed}s`);
+  } catch (e) {
+    console.warn('[NOTAM-Seed] Seed error:', e?.message || e, '— extending TTL, retrying in 20min');
+    try { await upstashExpire(NOTAM_REDIS_KEY, NOTAM_SEED_TTL); } catch {}
+    notamRetryTimer = setTimeout(() => { seedNotamClosures().catch(() => {}); }, NOTAM_RETRY_MS);
+  } finally {
+    notamSeedInFlight = false;
+  }
 }
 
 function startNotamSeedLoop() {
@@ -2212,7 +2255,8 @@ const URLHAUS_AUTH_KEY = process.env.URLHAUS_AUTH_KEY || '';
 const OTX_API_KEY = process.env.OTX_API_KEY || '';
 const ABUSEIPDB_API_KEY = process.env.ABUSEIPDB_API_KEY || '';
 const CYBER_SEED_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2h — matches IOC feed update cadence
-const CYBER_SEED_TTL = 14400; // 4h — must outlive the 2h seed interval (2x)
+const CYBER_SEED_TTL = 21600; // 6h — 3x interval; survives 2 missed cycles before expiry
+const CYBER_RETRY_MS = 20 * 60 * 1000;
 const CYBER_RPC_KEY = 'cyber:threats:v2'; // must match handler REDIS_CACHE_KEY in list-cyber-threats.ts
 const CYBER_BOOTSTRAP_KEY = 'cyber:threats-bootstrap:v2';
 const CYBER_MAX_CACHED = 2000;
@@ -2484,51 +2528,70 @@ async function cyberFetchAbuseIpDb(limit) {
   } catch (e) { console.warn('[Cyber] AbuseIPDB fetch failed:', e?.message || e); return []; }
 }
 
+let cyberSeedInFlight = false;
+let cyberRetryTimer = null;
+
 async function seedCyberThreats() {
+  if (cyberSeedInFlight) return 0;
+  cyberSeedInFlight = true;
+  if (cyberRetryTimer) { clearTimeout(cyberRetryTimer); cyberRetryTimer = null; }
+
   const t0 = Date.now();
-  const days = 14;
-  const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
-  const MAX_LIMIT = 1000;
+  try {
+    const days = 14;
+    const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
+    const MAX_LIMIT = 1000;
 
-  const [feodo, urlhaus, c2intel, otx, abuseipdb] = await Promise.all([
-    cyberFetchFeodo(MAX_LIMIT, cutoffMs),
-    cyberFetchUrlhaus(MAX_LIMIT, cutoffMs),
-    cyberFetchC2Intel(MAX_LIMIT),
-    cyberFetchOtx(MAX_LIMIT, days),
-    cyberFetchAbuseIpDb(MAX_LIMIT),
-  ]);
+    const [feodo, urlhaus, c2intel, otx, abuseipdb] = await Promise.all([
+      cyberFetchFeodo(MAX_LIMIT, cutoffMs),
+      cyberFetchUrlhaus(MAX_LIMIT, cutoffMs),
+      cyberFetchC2Intel(MAX_LIMIT),
+      cyberFetchOtx(MAX_LIMIT, days),
+      cyberFetchAbuseIpDb(MAX_LIMIT),
+    ]);
 
-  if (feodo.length + urlhaus.length + c2intel.length + otx.length + abuseipdb.length === 0) {
-    console.warn('[Cyber] All sources returned 0 threats — skipping Redis write');
+    if (feodo.length + urlhaus.length + c2intel.length + otx.length + abuseipdb.length === 0) {
+      console.warn('[Cyber] All sources returned 0 threats — extending TTL, retrying in 20min');
+      try { await upstashExpire(CYBER_RPC_KEY, CYBER_SEED_TTL); await upstashExpire(CYBER_BOOTSTRAP_KEY, CYBER_SEED_TTL); } catch {}
+      cyberRetryTimer = setTimeout(() => { seedCyberThreats().catch(() => {}); }, CYBER_RETRY_MS);
+      return 0;
+    }
+
+    const combined = cyberDedupe([...feodo, ...urlhaus, ...c2intel, ...otx, ...abuseipdb]);
+    const hydrated = await cyberHydrateGeo(combined);
+    const geoCount = hydrated.filter((t) => cyberValidCoords(t.lat, t.lon)).length;
+    console.log(`[Cyber] Geo resolved: ${geoCount}/${hydrated.length}`);
+
+    hydrated.sort((a, b) => {
+      const aGeo = cyberValidCoords(a.lat, a.lon) ? 0 : 1;
+      const bGeo = cyberValidCoords(b.lat, b.lon) ? 0 : 1;
+      if (aGeo !== bGeo) return aGeo - bGeo;
+      const bySev = (CYBER_SEVERITY_RANK[CYBER_SEVERITY_MAP[b.severity]||'']||0) - (CYBER_SEVERITY_RANK[CYBER_SEVERITY_MAP[a.severity]||'']||0);
+      return bySev !== 0 ? bySev : (b.lastSeen || b.firstSeen) - (a.lastSeen || a.firstSeen);
+    });
+
+    const threats = hydrated.slice(0, CYBER_MAX_CACHED).map(cyberToProto);
+    if (threats.length === 0) {
+      console.warn('[Cyber] No threats after processing — extending TTL, retrying in 20min');
+      try { await upstashExpire(CYBER_RPC_KEY, CYBER_SEED_TTL); await upstashExpire(CYBER_BOOTSTRAP_KEY, CYBER_SEED_TTL); } catch {}
+      cyberRetryTimer = setTimeout(() => { seedCyberThreats().catch(() => {}); }, CYBER_RETRY_MS);
+      return 0;
+    }
+
+    const payload = { threats };
+    const ok1 = await upstashSet(CYBER_RPC_KEY, payload, CYBER_SEED_TTL);
+    const ok2 = await upstashSet(CYBER_BOOTSTRAP_KEY, payload, CYBER_SEED_TTL);
+    const ok3 = await upstashSet('seed-meta:cyber:threats', { fetchedAt: Date.now(), recordCount: threats.length }, 604800);
+    console.log(`[Cyber] Seeded ${threats.length} threats (feodo:${feodo.length} urlhaus:${urlhaus.length} c2intel:${c2intel.length} otx:${otx.length} abuseipdb:${abuseipdb.length} redis:${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    return threats.length;
+  } catch (e) {
+    console.warn('[Cyber] Seed error:', e?.message || e, '— extending TTL, retrying in 20min');
+    try { await upstashExpire(CYBER_RPC_KEY, CYBER_SEED_TTL); await upstashExpire(CYBER_BOOTSTRAP_KEY, CYBER_SEED_TTL); } catch {}
+    cyberRetryTimer = setTimeout(() => { seedCyberThreats().catch(() => {}); }, CYBER_RETRY_MS);
     return 0;
+  } finally {
+    cyberSeedInFlight = false;
   }
-
-  const combined = cyberDedupe([...feodo, ...urlhaus, ...c2intel, ...otx, ...abuseipdb]);
-  const hydrated = await cyberHydrateGeo(combined);
-  const geoCount = hydrated.filter((t) => cyberValidCoords(t.lat, t.lon)).length;
-  console.log(`[Cyber] Geo resolved: ${geoCount}/${hydrated.length}`);
-
-  // Sort geo-resolved first, then by severity/recency
-  hydrated.sort((a, b) => {
-    const aGeo = cyberValidCoords(a.lat, a.lon) ? 0 : 1;
-    const bGeo = cyberValidCoords(b.lat, b.lon) ? 0 : 1;
-    if (aGeo !== bGeo) return aGeo - bGeo;
-    const bySev = (CYBER_SEVERITY_RANK[CYBER_SEVERITY_MAP[b.severity]||'']||0) - (CYBER_SEVERITY_RANK[CYBER_SEVERITY_MAP[a.severity]||'']||0);
-    return bySev !== 0 ? bySev : (b.lastSeen || b.firstSeen) - (a.lastSeen || a.firstSeen);
-  });
-
-  const threats = hydrated.slice(0, CYBER_MAX_CACHED).map(cyberToProto);
-  if (threats.length === 0) {
-    console.warn('[Cyber] No threats from any source — skipping Redis write');
-    return 0;
-  }
-
-  const payload = { threats };
-  const ok1 = await upstashSet(CYBER_RPC_KEY, payload, CYBER_SEED_TTL);
-  const ok2 = await upstashSet(CYBER_BOOTSTRAP_KEY, payload, CYBER_SEED_TTL);
-  const ok3 = await upstashSet('seed-meta:cyber:threats', { fetchedAt: Date.now(), recordCount: threats.length }, 604800);
-  console.log(`[Cyber] Seeded ${threats.length} threats (feodo:${feodo.length} urlhaus:${urlhaus.length} c2intel:${c2intel.length} otx:${otx.length} abuseipdb:${abuseipdb.length} redis:${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-  return threats.length;
 }
 
 async function startCyberThreatsSeedLoop() {
@@ -2549,6 +2612,7 @@ async function startCyberThreatsSeedLoop() {
 // ─────────────────────────────────────────────────────────────
 const POSITIVE_EVENTS_INTERVAL_MS = 900_000; // 15 min
 const POSITIVE_EVENTS_TTL = 2700; // 3× interval
+const POSITIVE_EVENTS_RETRY_MS = 5 * 60 * 1000; // retry 5min after failure (short interval seeder)
 const POSITIVE_EVENTS_RPC_KEY = 'positive-events:geo:v1';
 const POSITIVE_EVENTS_BOOTSTRAP_KEY = 'positive_events:geo-bootstrap:v1';
 const POSITIVE_EVENTS_MAX = 500;
@@ -2634,10 +2698,12 @@ function fetchGdeltGeoPositive(query) {
 }
 
 let positiveEventsInFlight = false;
+let positiveEventsRetryTimer = null;
 
 async function seedPositiveEvents() {
   if (positiveEventsInFlight) return;
   positiveEventsInFlight = true;
+  if (positiveEventsRetryTimer) { clearTimeout(positiveEventsRetryTimer); positiveEventsRetryTimer = null; }
   const t0 = Date.now();
   try {
     const allEvents = [];
@@ -2659,7 +2725,9 @@ async function seedPositiveEvents() {
     }
 
     if (!anyQuerySucceeded) {
-      console.warn('[PositiveEvents] All queries failed — preserving last good data');
+      console.warn('[PositiveEvents] All queries failed — extending TTL, retrying in 5min');
+      try { await upstashExpire(POSITIVE_EVENTS_RPC_KEY, POSITIVE_EVENTS_TTL); await upstashExpire(POSITIVE_EVENTS_BOOTSTRAP_KEY, POSITIVE_EVENTS_TTL); } catch {}
+      positiveEventsRetryTimer = setTimeout(() => { seedPositiveEvents().catch(() => {}); }, POSITIVE_EVENTS_RETRY_MS);
       return;
     }
 
@@ -2670,7 +2738,9 @@ async function seedPositiveEvents() {
     const ok3 = await upstashSet('seed-meta:positive-events:geo', { fetchedAt: Date.now(), recordCount: capped.length }, 604800);
     console.log(`[PositiveEvents] Seeded ${capped.length} events (redis: ${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
-    console.warn('[PositiveEvents] Seed error:', e?.message || e);
+    console.warn('[PositiveEvents] Seed error:', e?.message || e, '— extending TTL, retrying in 5min');
+    try { await upstashExpire(POSITIVE_EVENTS_RPC_KEY, POSITIVE_EVENTS_TTL); await upstashExpire(POSITIVE_EVENTS_BOOTSTRAP_KEY, POSITIVE_EVENTS_TTL); } catch {}
+    positiveEventsRetryTimer = setTimeout(() => { seedPositiveEvents().catch(() => {}); }, POSITIVE_EVENTS_RETRY_MS);
   } finally {
     positiveEventsInFlight = false;
   }
@@ -3076,6 +3146,37 @@ const THEATER_QUERY_REGIONS = [
   { name: 'PACIFIC', lamin: 4, lamax: 44, lomin: 104, lomax: 133 },
 ];
 
+// In-memory index of recently-seen Wingbits positions, keyed by ICAO24.
+// Populated on every successful bbox response; served for callsign-only lookups.
+// Entries expire after 5 minutes (Wingbits data is live, stale beyond that is misleading).
+const WINGBITS_POS_INDEX = new Map(); // icao24 -> { position, ts }
+const WINGBITS_POS_INDEX_TTL_MS = 5 * 60 * 1000;
+
+function wingbitsIndexUpdate(positions) {
+  const ts = Date.now();
+  for (const p of positions) {
+    if (p.icao24) WINGBITS_POS_INDEX.set(p.icao24, { position: p, ts });
+  }
+  // Prune stale entries to prevent unbounded growth.
+  if (WINGBITS_POS_INDEX.size > 5000) {
+    const cutoff = ts - WINGBITS_POS_INDEX_TTL_MS;
+    for (const [k, v] of WINGBITS_POS_INDEX) {
+      if (v.ts < cutoff) WINGBITS_POS_INDEX.delete(k);
+    }
+  }
+}
+
+function wingbitsIndexLookupCallsign(callsign) {
+  const cutoff = Date.now() - WINGBITS_POS_INDEX_TTL_MS;
+  const results = [];
+  for (const { position, ts } of WINGBITS_POS_INDEX.values()) {
+    if (ts < cutoff) continue;
+    const cs = (position.callsign || '').trim().toUpperCase();
+    if (cs.includes(callsign)) results.push(position);
+  }
+  return results;
+}
+
 async function handleWingbitsTrackRequest(req, res) {
   const apiKey = process.env.WINGBITS_API_KEY;
   if (!apiKey) {
@@ -3085,12 +3186,78 @@ async function handleWingbitsTrackRequest(req, res) {
 
   const url = new URL(req.url, 'http://localhost');
   const params = url.searchParams;
+  const callsignFilter = (params.get('callsign') || '').trim().toUpperCase();
   const laminStr = params.get('lamin');
   const lominStr = params.get('lomin');
   const lamaxStr = params.get('lamax');
   const lomaxStr = params.get('lomax');
 
-  if (!laminStr || !lominStr || !lamaxStr || !lomaxStr) {
+  // For callsign-only searches (no bbox), serve from the in-memory position index populated
+  // by recent bbox responses. On index miss, fall back to a global Wingbits API call.
+  const isBboxMissing = !laminStr || !lominStr || !lamaxStr || !lomaxStr;
+  if (callsignFilter && isBboxMissing) {
+    const hits = wingbitsIndexLookupCallsign(callsignFilter);
+    if (hits.length > 0) {
+      return sendCompressed(req, res, 200,
+        { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        JSON.stringify({ positions: hits, source: 'wingbits' }));
+    }
+    // Index miss — flight not in any recent viewport. Try a global Wingbits API call.
+    try {
+      const globalAreas = [{ alias: 'global', by: 'box', la: 0, lo: 0, w: 21600, h: 10800, unit: 'nm' }];
+      const gbResp = await fetch('https://customer-api.wingbits.com/v1/flights', {
+        method: 'POST',
+        headers: { 'x-api-key': apiKey, Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': CHROME_UA },
+        body: JSON.stringify(globalAreas),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (gbResp.ok) {
+        const gbData = await gbResp.json();
+        if (Array.isArray(gbData)) {
+          const now = Date.now();
+          const positions = [];
+          const seenIds = new Set();
+          for (const areaResult of gbData) {
+            const flightList = Array.isArray(areaResult.data) ? areaResult.data
+              : Array.isArray(areaResult.flights) ? areaResult.flights
+              : Array.isArray(areaResult) ? areaResult : [];
+            for (const f of flightList) {
+              const icao24 = f.h || f.icao24 || f.id || '';
+              if (!icao24 || seenIds.has(icao24)) continue;
+              const cs = (f.f || f.callsign || f.flight || '').trim().toUpperCase();
+              if (!cs.includes(callsignFilter)) continue;
+              seenIds.add(icao24);
+              positions.push({
+                icao24,
+                callsign: (f.f || f.callsign || f.flight || '').trim(),
+                lat: f.la ?? f.latitude ?? f.lat ?? 0,
+                lon: f.lo ?? f.longitude ?? f.lon ?? f.lng ?? 0,
+                altitudeM: (f.ab ?? f.altitude ?? f.alt ?? 0) * 0.3048,
+                groundSpeedKts: f.gs ?? f.groundSpeed ?? f.speed ?? 0,
+                trackDeg: f.th ?? f.heading ?? f.track ?? 0,
+                verticalRate: 0,
+                onGround: f.og ?? f.gr ?? f.onGround ?? false,
+                source: 'POSITION_SOURCE_WINGBITS',
+                observedAt: f.ra ? new Date(f.ra).getTime() : now,
+              });
+            }
+          }
+          wingbitsIndexUpdate(positions);
+          logThrottled('log', 'wingbits-callsign-global', `[Wingbits Track] global callsign fallback: ${positions.length} hits for "${callsignFilter}"`);
+          return sendCompressed(req, res, 200,
+            { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+            JSON.stringify({ positions, source: 'wingbits' }));
+        }
+      }
+    } catch (err) {
+      console.warn(`[Wingbits Track] Global callsign fallback failed: ${err?.message || err}`);
+    }
+    return sendCompressed(req, res, 200,
+      { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      JSON.stringify({ positions: [], source: 'wingbits' }));
+  }
+
+  if (isBboxMissing) {
     return safeEnd(res, 400, { 'Content-Type': 'application/json' },
       JSON.stringify({ error: 'Missing bbox params: lamin, lomin, lamax, lomax', positions: [] }));
   }
@@ -3142,6 +3309,11 @@ async function handleWingbitsTrackRequest(req, res) {
       for (const f of flightList) {
         const icao24 = f.h || f.icao24 || f.id || '';
         if (!icao24 || seenIds.has(icao24)) continue;
+        // For callsign searches, skip non-matching flights early to keep response small.
+        if (callsignFilter) {
+          const cs = (f.f || f.callsign || f.flight || '').trim().toUpperCase();
+          if (!cs.includes(callsignFilter)) continue;
+        }
         seenIds.add(icao24);
         const lat = f.la ?? f.latitude ?? f.lat ?? 0;
         const lon = f.lo ?? f.longitude ?? f.lon ?? f.lng ?? 0;
@@ -3161,6 +3333,8 @@ async function handleWingbitsTrackRequest(req, res) {
       }
     }
 
+    // Populate in-memory index so callsign-only lookups can resolve without a global API call.
+    wingbitsIndexUpdate(positions);
     logThrottled('log', 'wingbits-track', `[Wingbits Track] ${positions.length} flights for bbox ${lamin},${lomin},${lamax},${lomax}`);
     return sendCompressed(req, res, 200,
       { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=30', 'CDN-Cache-Control': 'public, max-age=15' },
@@ -3626,6 +3800,108 @@ async function startSpendingSeedLoop() {
   setInterval(() => {
     seedUsaSpending().catch((e) => console.warn('[Spending] Seed error:', e?.message || e));
   }, SPENDING_SEED_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// GSCPI seed — NY Fed Global Supply Chain Pressure Index
+// CSV fetched from newyorkfed.org (no API key required).
+// Published monthly; seeded daily to catch fresh releases.
+// Stored in FRED-compatible format under economic:fred:v1:GSCPI:0
+// so the existing GetFredSeriesBatch RPC serves it without changes.
+// ─────────────────────────────────────────────────────────────
+
+const GSCPI_SEED_TTL = 259200; // 72h — 3x 24h interval; survives 2 missed cycles
+const GSCPI_RETRY_MS = 20 * 60 * 1000; // 20min retry on failure
+const GSCPI_SEED_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
+const GSCPI_REDIS_KEY = 'economic:fred:v1:GSCPI:0'; // FRED-compatible key
+const GSCPI_CSV_URL = 'https://www.newyorkfed.org/medialibrary/research/interactives/data/gscpi/gscpi_interactive_data.csv';
+
+let gscpiSeedInFlight = false;
+let gscpiRetryTimer = null;
+
+function parseGscpiCsv(text) {
+  const MONTH_MAP = {
+    Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06',
+    Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12',
+  };
+  const lines = text.trim().split('\n').filter(l => l.trim() && !l.startsWith(','));
+  const observations = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(',');
+    const dateStr = cols[0]?.trim();
+    if (!dateStr) continue;
+    // Find last non-empty, non-#N/A value (latest vintage estimate)
+    let value = null;
+    for (let j = cols.length - 1; j >= 1; j--) {
+      const v = cols[j]?.trim();
+      if (v && v !== '#N/A' && v !== '') {
+        const num = parseFloat(v);
+        if (!isNaN(num)) { value = num; break; }
+      }
+    }
+    if (value === null) continue;
+    // Parse "31-Jan-2026" → "2026-01-01"
+    const parts = dateStr.split('-');
+    if (parts.length !== 3) continue;
+    const mon = MONTH_MAP[parts[1]];
+    const year = parts[2];
+    if (!mon || !year) continue;
+    observations.push({ date: `${year}-${mon}-01`, value });
+  }
+  // Return oldest-first (FRED convention)
+  return observations.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+async function seedGscpi() {
+  if (gscpiSeedInFlight) return;
+  gscpiSeedInFlight = true;
+  if (gscpiRetryTimer) { clearTimeout(gscpiRetryTimer); gscpiRetryTimer = null; }
+  try {
+    const resp = await fetch(GSCPI_CSV_URL, {
+      headers: { 'User-Agent': CHROME_UA, Accept: 'text/csv,text/plain' },
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const text = await resp.text();
+    const observations = parseGscpiCsv(text);
+    if (observations.length === 0) {
+      console.warn('[GSCPI] No data parsed — extending TTL, retrying in 20min');
+      try { await upstashExpire(GSCPI_REDIS_KEY, GSCPI_SEED_TTL); } catch {}
+      gscpiRetryTimer = setTimeout(() => { seedGscpi().catch(() => {}); }, GSCPI_RETRY_MS);
+      return;
+    }
+    const latest = observations[observations.length - 1];
+    const payload = {
+      series: {
+        series_id: 'GSCPI',
+        title: 'Global Supply Chain Pressure Index',
+        units: 'Standard Deviations',
+        frequency: 'Monthly',
+        observations,
+      },
+    };
+    await upstashSet(GSCPI_REDIS_KEY, payload, GSCPI_SEED_TTL);
+    await upstashSet('seed-meta:economic:gscpi', { fetchedAt: Date.now(), recordCount: observations.length }, 604800);
+    console.log(`[GSCPI] Seeded ${observations.length} months; latest ${latest.date} = ${latest.value.toFixed(2)}`);
+  } catch (e) {
+    console.warn('[GSCPI] Seed error:', e?.message, '— extending TTL, retrying in 20min');
+    try { await upstashExpire(GSCPI_REDIS_KEY, GSCPI_SEED_TTL); } catch {}
+    gscpiRetryTimer = setTimeout(() => { seedGscpi().catch(() => {}); }, GSCPI_RETRY_MS);
+  } finally {
+    gscpiSeedInFlight = false;
+  }
+}
+
+async function startGscpiSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[GSCPI] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log('[GSCPI] Seed loop starting (interval 24h)');
+  seedGscpi().catch((e) => console.warn('[GSCPI] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedGscpi().catch((e) => console.warn('[GSCPI] Seed error:', e?.message || e));
+  }, GSCPI_SEED_INTERVAL_MS).unref?.();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -8423,6 +8699,7 @@ server.listen(PORT, () => {
 
   startWeatherSeedLoop();
   startSpendingSeedLoop();
+  startGscpiSeedLoop();
   startWorldBankSeedLoop();
   startSatelliteSeedLoop();
   startTechEventsSeedLoop();

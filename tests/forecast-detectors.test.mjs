@@ -67,6 +67,7 @@ import {
   buildFeedSummary,
   buildFallbackPerspectives,
   populateFallbackNarratives,
+  refreshPublishedNarratives,
   loadCascadeRules,
   evaluateRuleConditions,
   summarizePublishFiltering,
@@ -1264,7 +1265,7 @@ describe('forecast narrative fallbacks', () => {
     assert.ok(contrarianCase.length <= 500);
   });
 
-  it('fallback narratives reference broader situation context when available', () => {
+  it('fallback narratives keep situation context without broader-cluster filler', () => {
     const pred = makePrediction('conflict', 'Iran', 'Escalation risk: Iran', 0.63, 0.48, '7d', [
       { type: 'ucdp', value: '27 conflict events in Iran', weight: 0.5 },
     ]);
@@ -1281,21 +1282,43 @@ describe('forecast narrative fallbacks', () => {
     const baseCase = buildFallbackBaseCase(pred);
     const summary = buildFeedSummary(pred);
 
-    assert.match(baseCase, /broader|cluster/i);
-    assert.match(scenario, /broader|cluster/i);
-    assert.match(summary, /broader|cluster/i);
+    assert.match(baseCase, /27 conflict events in Iran/i);
+    assert.ok(!scenario.match(/broader|cluster/i));
+    assert.ok(!summary.match(/broader|cluster/i));
   });
 
-  it('buildFeedSummary stays compact and distinct from the deeper case output', () => {
+  it('buildFeedSummary preserves the full narrative without server-side clipping', () => {
     const pred = makePrediction('conflict', 'Iran', 'Escalation risk: Iran', 0.7, 0.6, '7d', [
       { type: 'cii', value: 'Iran CII 87 (critical)', weight: 0.4 },
       { type: 'ucdp', value: '3 UCDP conflict events', weight: 0.3 },
     ]);
     buildForecastCase(pred);
-    pred.caseFile.baseCase = 'Iran CII 87 (critical) and 3 UCDP conflict events keep the base path elevated over the next 7d with persistent force pressure.';
+    pred.caseFile.baseCase = 'Iran CII 87 (critical) and 3 UCDP conflict events keep the base path elevated over the next 7d with persistent force pressure and increasingly visible cross-border signaling, while regional actors still avoid a decisive break into a wider confrontation.';
     const summary = buildFeedSummary(pred);
-    assert.ok(summary.length <= 180);
+    assert.ok(summary.length > 180);
+    assert.ok(!summary.endsWith('...'));
     assert.match(summary, /Iran CII 87/);
+  });
+
+  it('refreshPublishedNarratives preserves validated llm narratives and only fills gaps', () => {
+    const pred = makePrediction('market', 'Strait of Hormuz', 'Inflation and rates pressure from Strait of Hormuz maritime disruption state', 0.69, 0.64, '30d', [
+      { type: 'shipping_cost_shock', value: 'Strait of Hormuz shipping costs remain elevated', weight: 0.42 },
+    ]);
+    buildForecastCase(pred);
+    pred.traceMeta = { narrativeSource: 'llm_combined', llmProvider: 'openrouter' };
+    pred.caseFile.baseCase = 'LLM base case keeps Hormuz freight and energy repricing tied to persistent shipping disruption over the next 30d.';
+    pred.caseFile.escalatoryCase = 'LLM escalatory case sees a sharper repricing if maritime insurance and rerouting costs jump again.';
+    pred.caseFile.contrarianCase = 'LLM contrarian case assumes corridor access stabilizes before the freight shock spreads further.';
+    pred.scenario = 'LLM scenario keeps Hormuz inflation pressure elevated while the corridor remains contested.';
+    pred.feedSummary = '';
+
+    refreshPublishedNarratives([pred]);
+
+    assert.equal(pred.caseFile.baseCase, 'LLM base case keeps Hormuz freight and energy repricing tied to persistent shipping disruption over the next 30d.');
+    assert.equal(pred.caseFile.escalatoryCase, 'LLM escalatory case sees a sharper repricing if maritime insurance and rerouting costs jump again.');
+    assert.equal(pred.caseFile.contrarianCase, 'LLM contrarian case assumes corridor access stabilizes before the freight shock spreads further.');
+    assert.equal(pred.scenario, 'LLM scenario keeps Hormuz inflation pressure elevated while the corridor remains contested.');
+    assert.equal(pred.feedSummary, 'LLM base case keeps Hormuz freight and energy repricing tied to persistent shipping disruption over the next 30d.');
   });
 });
 
@@ -1311,6 +1334,19 @@ describe('validateCaseNarratives', () => {
       contrarianCase: 'If no new corroborating headlines appear, the current path would lose support and flatten out.',
     }], [pred]);
     assert.equal(valid.length, 1);
+  });
+
+  it('accepts partial case narratives when at least one branch is substantive', () => {
+    const pred = makePrediction('market', 'India', 'FX stress from India cyber pressure state', 0.68, 0.61, '30d', [
+      { type: 'fx_stress', value: 'India cyber pressure state is keeping FX stress active', weight: 0.42 },
+    ]);
+    const valid = validateCaseNarratives([{
+      index: 0,
+      baseCase: 'India cyber pressure state remains the clearest anchor for the current FX stress base case over the next 30d.',
+    }], [pred]);
+    assert.equal(valid.length, 1);
+    assert.match(valid[0].baseCase, /India cyber pressure state/);
+    assert.equal(valid[0].escalatoryCase, undefined);
   });
 });
 
@@ -1461,6 +1497,18 @@ describe('validateScenarios', () => {
     assert.equal(valid.length, 1);
     delete preds[0].calibration;
     delete preds[0].caseFile;
+  });
+
+  it('accepts scenario with state-label evidence for state-derived forecasts', () => {
+    preds[0].stateContext = {
+      id: 'state-india-fx',
+      label: 'India cyber pressure state',
+      sampleTitles: ['FX stress from India cyber pressure state'],
+    };
+    const scenarios = [{ index: 0, scenario: 'India cyber pressure state remains the clearest anchor for the current FX stress path over the next 30d.' }];
+    const valid = validateScenarios(scenarios, preds);
+    assert.equal(valid.length, 1);
+    delete preds[0].stateContext;
   });
 
   it('rejects scenario without any evidence reference', () => {
